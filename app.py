@@ -15,12 +15,50 @@ st.title("🌦️ Next-Gen AI Weather Forecaster")
 st.markdown("### 🚨 Predicting dangerous Wet-Bulb Temperature (WBT) levels 10 days in advance using 41 years of NASA meteorological data.")
 st.markdown("---")
 
+# --- 🛠️ FEATURE ENGINEERING ENGINE (ADDED!) ---
+def engineer_ml_features(df):
+    df = df.copy()
+    df['location_id'] = df['rel_lat'].round(4).astype(str) + "_" + df['rel_lon'].round(4).astype(str)
+
+    df['DTR'] = df['T2M_MAX'] - df['T2M_MIN']
+    if 'ALLSKY_SFC_SW_DWN' in df.columns and 'CLRSKY_SFC_SW_DWN' in df.columns:
+        df['SOLAR_DELTA'] = df['ALLSKY_SFC_SW_DWN'] - df['CLRSKY_SFC_SW_DWN']
+    if 'EVLAND' in df.columns and 'GWETTOP' in df.columns:
+        df['EVAP_STRESS'] = df['EVLAND'] / (df['GWETTOP'] + 1e-5)
+    
+    df['TEMP_HUM_CROSS'] = df['T2M_MAX'] * df['RH2M']
+
+    features_to_roll = ['T2M_MAX', 'RH2M', 'DTR', 'EVAP_STRESS', 'WBT']
+    grouped = df.groupby('location_id')
+
+    for feat in features_to_roll:
+        if feat in df.columns:
+            df[f'{feat}_ewma_3'] = grouped[feat].transform(lambda x: x.ewm(span=3, adjust=False).mean())
+            df[f'{feat}_ewma_14'] = grouped[feat].transform(lambda x: x.ewm(span=14, adjust=False).mean())
+            df[f'{feat}_max_7d'] = grouped[feat].transform(lambda x: x.rolling(7, min_periods=1).max())
+            df[f'{feat}_min_7d'] = grouped[feat].transform(lambda x: x.rolling(7, min_periods=1).min())
+            df[f'{feat}_lag_1'] = grouped[feat].shift(1)
+            df[f'{feat}_lag_2'] = grouped[feat].shift(2)
+            df[f'{feat}_lag_3'] = grouped[feat].shift(3)
+
+    if 'date' in df.columns:
+        day_of_year = pd.to_datetime(df['date']).dt.dayofyear
+    else:
+        day_of_year = (df.get('day_index', 1) % 365) + 1
+
+    df['sin_day'] = np.sin(2 * np.pi * day_of_year / 365.0)
+    df['cos_day'] = np.cos(2 * np.pi * day_of_year / 365.0)
+
+    return df
+
 # --- LOAD DATA ---
 @st.cache_data
 def load_data():
     try:
-        df = pd.read_csv('test.csv').head(200)
-        return df
+        # Load raw data AND apply feature engineering immediately
+        raw_df = pd.read_csv('test.csv').head(200)
+        engineered_df = engineer_ml_features(raw_df)
+        return engineered_df
     except FileNotFoundError:
         st.error("⚠️ test.csv not found! Make sure it is in the same folder as app.py")
         return None
@@ -67,24 +105,24 @@ with col2:
                 for day in range(1, 11):
                     status_text.text(f"Loading Models and Calculating Day {day}...")
                     
-                    # 1. Load the Indestructible CatBoost Model (Using your exact folder name!)
+                    # 1. Load the Indestructible CatBoost Model
                     model_cat = CatBoostRegressor()
                     model_cat.load_model(f'saved_model/cat_day_{day}.cbm')
                     pred_cat = model_cat.predict(X_live)[0]
 
-                    # 2. Try loading LightGBM (Wrap in Safety Net)
+                    # 2. Try loading LightGBM 
                     try:
                         model_lgb = joblib.load(f'saved_model/lgb_day_{day}.pkl')
                         pred_lgb = model_lgb.predict(X_live)[0]
                     except Exception:
-                        pred_lgb = pred_cat  # Fallback to CatBoost math if pickle corrupts
+                        pred_lgb = pred_cat  
 
-                    # 3. Try loading XGBoost (Wrap in Safety Net)
+                    # 3. Try loading XGBoost
                     try:
                         model_xgb = joblib.load(f'saved_model/xgb_day_{day}.pkl')
                         pred_xgb = model_xgb.predict(X_live)[0]
                     except Exception:
-                        pred_xgb = pred_cat  # Fallback to CatBoost math if pickle corrupts
+                        pred_xgb = pred_cat 
 
                     # Blend using your exact formula
                     live_prediction = (pred_lgb * 0.45) + (pred_xgb * 0.40) + (pred_cat * 0.15)
@@ -111,13 +149,17 @@ with col2:
                 fig.add_hline(y=35, line_dash="solid", line_color="red", annotation_text="Lethal Limit (35°C) ", annotation_position="top left")
                 fig.add_hline(y=30, line_dash="dash", line_color="orange", annotation_text="Severe Danger Zone (30°C) ", annotation_position="top left")
 
+                # Handle potential NaN values in plot scaling by filtering them out for the min/max calculation
+                valid_forecasts = [val for val in full_10_day_forecast if not np.isnan(val)]
+                min_y = min(valid_forecasts) - 2 if valid_forecasts else 15
+                
                 fig.update_layout(
                     title=f"Wet Bulb Temperature (WBT) Projection",
                     xaxis_title="Forecast Horizon",
                     yaxis_title="Temperature (°C)",
                     template="plotly_dark",
                     hovermode="x unified",
-                    yaxis=dict(range=[min(min(full_10_day_forecast)-2, 15), 40])
+                    yaxis=dict(range=[min(min_y, 15), 40])
                 )
                 
                 st.plotly_chart(fig, use_container_width=True)
