@@ -70,11 +70,11 @@ with col2:
                     status_text.text(f"Loading Models and Calculating Day {day}...")
                     
                     # Load the models for this specific day
-                    model_lgb = joblib.load(f'saved_models/lgb_day_{day}.pkl')
-                    model_xgb = joblib.load(f'saved_models/xgb_day_{day}.pkl')
+                    model_lgb = joblib.load(f'saved_model/lgb_day_{day}.pkl')
+                    model_xgb = joblib.load(f'saved_model/xgb_day_{day}.pkl')
                     
                     model_cat = CatBoostRegressor()
-                    model_cat.load_model(f'saved_models/cat_day_{day}.cbm')
+                    model_cat.load_model(f'saved_model/cat_day_{day}.cbm')
 
                     # Predict
                     pred_lgb = model_lgb.predict(X_live)[0]
@@ -125,4 +125,4 @@ with col2:
                 st.plotly_chart(fig, use_container_width=True)
 
             except Exception as e:
-                st.error(f"Error loading models. Did you put the 'saved_models' folder in the same directory? Error: {e}")
+                st.error(f"Error loading models. Did you put the 'saved_model' folder in the same directory? Error: {e}")
