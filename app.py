@@ -15,7 +15,7 @@ st.title("🌦️ Next-Gen AI Weather Forecaster")
 st.markdown("### 🚨 Predicting dangerous Wet-Bulb Temperature (WBT) levels 10 days in advance using 41 years of NASA meteorological data.")
 st.markdown("---")
 
-# --- 🛠️ FEATURE ENGINEERING ENGINE (ADDED!) ---
+# --- 🛠️ FEATURE ENGINEERING ENGINE ---
 def engineer_ml_features(df):
     df = df.copy()
     df['location_id'] = df['rel_lat'].round(4).astype(str) + "_" + df['rel_lon'].round(4).astype(str)
@@ -51,6 +51,18 @@ def engineer_ml_features(df):
 
     return df
 
+# --- MODEL VALIDATION HELPER ---
+@st.cache_resource
+def get_model_expected_features():
+    """Loads the day 1 CatBoost model just to extract the exact feature names it expects."""
+    try:
+        temp_model = CatBoostRegressor()
+        temp_model.load_model('saved_model/cat_day_1.cbm')
+        return temp_model.feature_names_
+    except Exception as e:
+        st.sidebar.error(f"⚠️ Could not load model to verify features: {e}")
+        return None
+
 # --- LOAD DATA ---
 @st.cache_data
 def load_data():
@@ -64,6 +76,20 @@ def load_data():
         return None
 
 test_data = load_data()
+expected_features = get_model_expected_features()
+
+# --- VALIDATION CHECK ---
+# We verify the features before drawing the rest of the UI
+if test_data is not None and expected_features is not None:
+    live_features = list(test_data.columns)
+    missing_features = set(expected_features) - set(live_features)
+    
+    if missing_features:
+        st.error("🚨 **CRITICAL DATA MISMATCH** 🚨")
+        st.write("Your models were trained on features that are currently missing from your engineered `test.csv` data.")
+        st.error(f"**Missing Features:** {', '.join(missing_features)}")
+        st.info("💡 **Hint:** Check if 'ALLSKY_SFC_SW_DWN' or other raw columns used in `engineer_ml_features` are actually in your `test.csv`.")
+        st.stop() # This halts the Streamlit app right here until the error is fixed.
 
 # --- SIDEBAR ---
 st.sidebar.header("⚙️ Forecast Parameters")
@@ -76,93 +102,110 @@ if test_data is not None:
     st.sidebar.caption("🛡️ Variance Shield Active")
 
 # --- MAIN DASHBOARD ---
-col1, col2 = st.columns([1, 2])
+if test_data is not None:
+    col1, col2 = st.columns([1, 2])
 
-with col1:
-    st.subheader("📡 Input Telemetry")
-    st.write("Current atmospheric features going into the models:")
-    if test_data is not None:
+    with col1:
+        st.subheader("📡 Input Telemetry")
+        st.write("Current atmospheric features going into the models:")
         display_data = test_data[test_data['row_id'] == selected_row].drop(columns=['row_id', 'date', 'location_id'], errors='ignore')
         st.dataframe(display_data.T, use_container_width=True)
 
-with col2:
-    st.subheader("🚀 Live 10-Day AI Forecast")
-    
-    if st.button("Run Full 10-Day Machine Learning Inference", type="primary"):
+    with col2:
+        st.subheader("🚀 Live 10-Day AI Forecast")
         
-        row_data = test_data[test_data['row_id'] == selected_row]
-        exclude_cols = ['row_id', 'location_id', 'date', 'day_index', 'WBT']
-        features = [c for c in row_data.columns if c not in exclude_cols]
-        X_live = row_data[features].values
-        
-        full_10_day_forecast = []
-        
-        with st.spinner("Initializing AI Engine..."):
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        if st.button("Run Full 10-Day Machine Learning Inference", type="primary"):
             
-            try:
-                for day in range(1, 11):
-                    status_text.text(f"Loading Models and Calculating Day {day}...")
+            row_data = test_data[test_data['row_id'] == selected_row]
+            exclude_cols = ['row_id', 'location_id', 'date', 'day_index', 'WBT']
+            features = [c for c in row_data.columns if c not in exclude_cols]
+            
+            # CRITICAL FIX: Pass as DataFrame to retain feature names
+            X_live = row_data[features]
+            
+            full_10_day_forecast = []
+            
+            with st.spinner("Initializing AI Engine..."):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                try:
+                    for day in range(1, 11):
+                        status_text.text(f"Loading Models and Calculating Day {day}...")
+                        
+                        # 1. Load the CatBoost Model safely (handles missing day 8)
+                        try:
+                            model_cat = CatBoostRegressor()
+                            model_cat.load_model(f'saved_model/cat_day_{day}.cbm')
+                            pred_cat = model_cat.predict(X_live)[0]
+                        except Exception as e:
+                            st.warning(f"CatBoost Day {day} failed: {e}")
+                            pred_cat = np.nan
+
+                        # 2. Try loading LightGBM 
+                        try:
+                            model_lgb = joblib.load(f'saved_model/lgb_day_{day}.pkl')
+                            pred_lgb = model_lgb.predict(X_live)[0]
+                        except Exception:
+                            pred_lgb = pred_cat if not np.isnan(pred_cat) else np.nan
+
+                        # 3. Try loading XGBoost
+                        try:
+                            model_xgb = joblib.load(f'saved_model/xgb_day_{day}.pkl')
+                            pred_xgb = model_xgb.predict(X_live)[0]
+                        except Exception:
+                            pred_xgb = pred_cat if not np.isnan(pred_cat) else np.nan
+
+                        # Blend logic using valid predictions
+                        valid_preds = [p for p in [pred_lgb, pred_xgb, pred_cat] if not np.isnan(p)]
+                        
+                        if len(valid_preds) == 3:
+                            live_prediction = (pred_lgb * 0.45) + (pred_xgb * 0.40) + (pred_cat * 0.15)
+                        elif len(valid_preds) > 0:
+                            live_prediction = np.mean(valid_preds) # Fallback to average if a model is missing
+                        else:
+                            live_prediction = np.nan # If all fail
+
+                        if not np.isnan(live_prediction):
+                            live_prediction = np.clip(live_prediction, -10, 45)
+                            
+                        full_10_day_forecast.append(live_prediction)
+                        
+                        progress_bar.progress(day * 10)
                     
-                    # 1. Load the Indestructible CatBoost Model
-                    model_cat = CatBoostRegressor()
-                    model_cat.load_model(f'saved_model/cat_day_{day}.cbm')
-                    pred_cat = model_cat.predict(X_live)[0]
-
-                    # 2. Try loading LightGBM 
-                    try:
-                        model_lgb = joblib.load(f'saved_model/lgb_day_{day}.pkl')
-                        pred_lgb = model_lgb.predict(X_live)[0]
-                    except Exception:
-                        pred_lgb = pred_cat  
-
-                    # 3. Try loading XGBoost
-                    try:
-                        model_xgb = joblib.load(f'saved_model/xgb_day_{day}.pkl')
-                        pred_xgb = model_xgb.predict(X_live)[0]
-                    except Exception:
-                        pred_xgb = pred_cat 
-
-                    # Blend using your exact formula
-                    live_prediction = (pred_lgb * 0.45) + (pred_xgb * 0.40) + (pred_cat * 0.15)
-                    live_prediction = np.clip(live_prediction, -10, 45)
-                    full_10_day_forecast.append(live_prediction)
+                    status_text.empty()
+                    st.success("✅ Full 10-Day Machine Learning Inference Complete!")
                     
-                    progress_bar.progress(day * 10)
-                
-                status_text.empty()
-                st.success("✅ Full 10-Day Machine Learning Inference Complete!")
-                
-                # --- PLOTLY INTERACTIVE GRAPH ---
-                days = [f"Day {i}" for i in range(1, 11)]
-                fig = go.Figure()
-                
-                fig.add_trace(go.Scatter(
-                    x=days, y=full_10_day_forecast, 
-                    mode='lines+markers',
-                    name='Predicted WBT',
-                    line=dict(color='#00FF00', width=3),
-                    marker=dict(size=10, symbol='diamond')
-                ))
-                
-                fig.add_hline(y=35, line_dash="solid", line_color="red", annotation_text="Lethal Limit (35°C) ", annotation_position="top left")
-                fig.add_hline(y=30, line_dash="dash", line_color="orange", annotation_text="Severe Danger Zone (30°C) ", annotation_position="top left")
+                    # --- PLOTLY INTERACTIVE GRAPH ---
+                    days = [f"Day {i}" for i in range(1, 11)]
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Scatter(
+                        x=days, y=full_10_day_forecast, 
+                        mode='lines+markers',
+                        name='Predicted WBT',
+                        line=dict(color='#00FF00', width=3),
+                        marker=dict(size=10, symbol='diamond'),
+                        connectgaps=True # Connects the line over missing days if a model is completely missing
+                    ))
+                    
+                    fig.add_hline(y=35, line_dash="solid", line_color="red", annotation_text="Lethal Limit (35°C) ", annotation_position="top left")
+                    fig.add_hline(y=30, line_dash="dash", line_color="orange", annotation_text="Severe Danger Zone (30°C) ", annotation_position="top left")
 
-                # Handle potential NaN values in plot scaling by filtering them out for the min/max calculation
-                valid_forecasts = [val for val in full_10_day_forecast if not np.isnan(val)]
-                min_y = min(valid_forecasts) - 2 if valid_forecasts else 15
-                
-                fig.update_layout(
-                    title=f"Wet Bulb Temperature (WBT) Projection",
-                    xaxis_title="Forecast Horizon",
-                    yaxis_title="Temperature (°C)",
-                    template="plotly_dark",
-                    hovermode="x unified",
-                    yaxis=dict(range=[min(min_y, 15), 40])
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
+                    # Handle potential NaN values in plot scaling by filtering them out for the min/max calculation
+                    valid_forecasts = [val for val in full_10_day_forecast if not np.isnan(val)]
+                    min_y = min(valid_forecasts) - 2 if valid_forecasts else 15
+                    
+                    fig.update_layout(
+                        title=f"Wet Bulb Temperature (WBT) Projection",
+                        xaxis_title="Forecast Horizon",
+                        yaxis_title="Temperature (°C)",
+                        template="plotly_dark",
+                        hovermode="x unified",
+                        yaxis=dict(range=[min(min_y, 15), 40])
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
 
-            except Exception as e:
-                st.error(f"Critical System Error: {e}")
+                except Exception as e:
+                    st.error(f"Critical System Error: {e}")
