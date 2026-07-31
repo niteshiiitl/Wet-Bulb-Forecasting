@@ -62,7 +62,7 @@ def engineer_ml_features(df):
 
     return df
 
-# --- LOAD DATA (WITH CONTEXT ALIGNMENT TO PREVENT NANS) ---
+# --- LOAD DATA ENGINE (@cache_data for DataFrames) ---
 @st.cache_data
 def load_and_prepare_data():
     try:
@@ -101,7 +101,41 @@ def load_and_prepare_data():
         st.error("⚠️ Missing Data File: Ensure 'test.csv' and 'context.csv' are in the same directory as app.py.")
         return None, None
 
+
+# --- LOAD MODEL ENGINE (@cache_resource for ML Objects) ---
+@st.cache_resource(show_spinner="Loading 30 ML Models into RAM...")
+def load_all_models():
+    """Loads all models into memory ONCE during app boot."""
+    models = {'lgb': {}, 'xgb': {}, 'cat': {}}
+    
+    for day in range(1, 11):
+        # 1. CatBoost
+        try:
+            m_cat = CatBoostRegressor()
+            m_cat.load_model(f'saved_model/cat_day_{day}.cbm')
+            models['cat'][day] = m_cat
+        except Exception:
+            models['cat'][day] = None
+
+        # 2. LightGBM
+        try:
+            models['lgb'][day] = joblib.load(f'saved_model/lgb_day_{day}.pkl')
+        except Exception:
+            models['lgb'][day] = None
+
+        # 3. XGBoost
+        try:
+            models['xgb'][day] = joblib.load(f'saved_model/xgb_day_{day}.pkl')
+        except Exception:
+            models['xgb'][day] = None
+            
+    return models
+
+# ---------------------------------------------------------
+# EXECUTE STARTUP CACHING
+# ---------------------------------------------------------
 test_data, feature_cols = load_and_prepare_data()
+loaded_models = load_all_models()
 
 # --- SIDEBAR ---
 st.sidebar.header("⚙️ Forecast Parameters")
@@ -109,9 +143,9 @@ if test_data is not None:
     selected_row = st.sidebar.selectbox("Select a Location/Timepoint to Forecast:", test_data['row_id'].values)
     
     st.sidebar.markdown("---")
-    st.sidebar.success("✅ Live Inference Engine Active")
-    st.sidebar.info("🤖 Models: XGBoost + LightGBM + CatBoost")
-    st.sidebar.caption("🛡️ Variance Shield Active")
+    st.sidebar.success("✅ Models Cached in RAM")
+    st.sidebar.info("🤖 Engine: XGBoost + LightGBM + CatBoost")
+    st.sidebar.caption("⚡ Sub-second Inference Enabled")
 
 # --- MAIN DASHBOARD ---
 if test_data is not None:
@@ -129,19 +163,15 @@ if test_data is not None:
         if st.button("Run Full 10-Day Machine Learning Inference", type="primary"):
             row_data = test_data[test_data['row_id'] == selected_row]
             
-            # Pass as a DataFrame with feature columns to preserve feature names for tree models
+            # Use DataFrame to maintain column names for tree models
             X_live = row_data[feature_cols]
             baseline_wbt = row_data['WBT'].values[0]
             
             full_10_day_forecast = []
             
-            with st.spinner("Initializing AI Engine..."):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
+            with st.spinner("Executing Instant Inference Pipeline..."):
                 try:
                     for day in range(1, 11):
-                        status_text.text(f"Running Inference for Day {day}...")
                         
                         # Horizon-Specific Weighting
                         if (day - 1) < 4:
@@ -149,58 +179,33 @@ if test_data is not None:
                         else:
                             w_lgb, w_xgb, w_cat = 0.20, 0.30, 0.50
                         
-                        pred_cat_delta, pred_lgb_delta, pred_xgb_delta = np.nan, np.nan, np.nan
-                        
-                        # 1. CatBoost
-                        try:
-                            model_cat = CatBoostRegressor()
-                            model_cat.load_model(f'saved_model/cat_day_{day}.cbm')
-                            pred_cat_delta = model_cat.predict(X_live)[0]
-                        except Exception:
-                            pass
-
-                        # 2. LightGBM 
-                        try:
-                            model_lgb = joblib.load(f'saved_model/lgb_day_{day}.pkl')
-                            pred_lgb_delta = model_lgb.predict(X_live)[0]
-                        except Exception:
-                            pass
-
-                        # 3. XGBoost
-                        try:
-                            model_xgb = joblib.load(f'saved_model/xgb_day_{day}.pkl')
-                            pred_xgb_delta = model_xgb.predict(X_live)[0]
-                        except Exception:
-                            pass
-
-                        # Dynamic Weighted Blend (handles missing models gracefully)
                         valid_models = []
                         weights = []
                         
-                        if not np.isnan(pred_lgb_delta):
-                            valid_models.append(pred_lgb_delta)
+                        # Instantly predict using models already in RAM
+                        if loaded_models['lgb'][day] is not None:
+                            valid_models.append(loaded_models['lgb'][day].predict(X_live)[0])
                             weights.append(w_lgb)
-                        if not np.isnan(pred_xgb_delta):
-                            valid_models.append(pred_xgb_delta)
+                            
+                        if loaded_models['xgb'][day] is not None:
+                            valid_models.append(loaded_models['xgb'][day].predict(X_live)[0])
                             weights.append(w_xgb)
-                        if not np.isnan(pred_cat_delta):
-                            valid_models.append(pred_cat_delta)
+                            
+                        if loaded_models['cat'][day] is not None:
+                            valid_models.append(loaded_models['cat'][day].predict(X_live)[0])
                             weights.append(w_cat)
                         
+                        # Dynamic Blending
                         if valid_models:
                             norm_weights = np.array(weights) / sum(weights)
                             blended_delta = np.sum(np.array(valid_models) * norm_weights)
                         else:
-                            blended_delta = 0.0  # Fallback: no temperature change
-
-                        # Reverse Delta Transformation
-                        absolute_prediction = baseline_wbt + blended_delta
-                        absolute_prediction = np.clip(absolute_prediction, -10, 45)
+                            blended_delta = 0.0  # Fallback
                         
+                        # Reverse Delta Transformation
+                        absolute_prediction = np.clip(baseline_wbt + blended_delta, -10, 45)
                         full_10_day_forecast.append(absolute_prediction)
-                        progress_bar.progress(day * 10)
                     
-                    status_text.empty()
                     st.success("✅ Full 10-Day Horizon Inference Complete!")
                     
                     # --- PLOTLY INTERACTIVE GRAPH ---
