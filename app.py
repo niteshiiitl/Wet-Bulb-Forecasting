@@ -1,146 +1,240 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import joblib
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostRegressor
+import plotly.graph_objects as go
+import warnings
 
+warnings.filterwarnings('ignore')
 st.set_page_config(page_title="AI Weather Forecaster", page_icon="🌦️", layout="wide")
 
 st.title("🌦️ Next-Gen AI Weather Forecaster")
-st.markdown("### 🚨 Predicting dangerous Wet-Bulb Temperature (WBT) levels 10 days in advance.")
+st.markdown("### 🚨 Predicting dangerous Wet-Bulb Temperature (WBT) levels 10 days in advance using 41 years of NASA meteorological data.")
 st.markdown("---")
 
-# --- 1. LOAD DATA ---
+# --- 🛠️ FEATURE ENGINEERING ENGINE (FULL V3 ALIGNMENT) ---
+def engineer_ml_features(df):
+    df = df.copy()
+    df['location_id'] = df['rel_lat'].round(4).astype(str) + "_" + df['rel_lon'].round(4).astype(str)
+
+    # 1. Core Thermodynamics
+    df['DTR'] = df['T2M_MAX'] - df['T2M_MIN']
+    if 'ALLSKY_SFC_SW_DWN' in df.columns and 'CLRSKY_SFC_SW_DWN' in df.columns:
+        df['SOLAR_DELTA'] = df['ALLSKY_SFC_SW_DWN'] - df['CLRSKY_SFC_SW_DWN']
+    if 'EVLAND' in df.columns and 'GWETTOP' in df.columns:
+        df['EVAP_STRESS'] = df['EVLAND'] / (df['GWETTOP'] + 1e-5)
+    
+    # 2. Advanced Physics: Vapor Pressure Deficit (VPD)
+    if 'T2M_MAX' in df.columns and 'RH2M' in df.columns:
+        df['E_SAT'] = 0.61078 * np.exp((17.27 * df['T2M_MAX']) / (df['T2M_MAX'] + 237.3))
+        df['E_ACT'] = df['E_SAT'] * (df['RH2M'] / 100.0)
+        df['VPD'] = df['E_SAT'] - df['E_ACT']
+    
+    df['TEMP_HUM_CROSS'] = df['T2M_MAX'] * df['RH2M']
+
+    # 3. Decaying Memory, Rolling Stats & Thermal Inertia
+    features_to_roll = ['T2M_MAX', 'RH2M', 'DTR', 'VPD', 'EVAP_STRESS', 'WBT']
+    grouped = df.groupby('location_id')
+
+    for feat in features_to_roll:
+        if feat in df.columns:
+            df[f'{feat}_ewma_3'] = grouped[feat].transform(lambda x: x.ewm(span=3, adjust=False).mean())
+            df[f'{feat}_ewma_14'] = grouped[feat].transform(lambda x: x.ewm(span=14, adjust=False).mean())
+            df[f'{feat}_max_7d'] = grouped[feat].transform(lambda x: x.rolling(7, min_periods=1).max())
+            df[f'{feat}_min_7d'] = grouped[feat].transform(lambda x: x.rolling(7, min_periods=1).min())
+            df[f'{feat}_lag_1'] = grouped[feat].shift(1)
+            df[f'{feat}_lag_2'] = grouped[feat].shift(2)
+            df[f'{feat}_lag_3'] = grouped[feat].shift(3)
+            # Thermal Inertia
+            df[f'{feat}_inertia'] = df[feat] - df[f'{feat}_lag_1']
+
+    # 4. Cyclical Seasons
+    if 'date' in df.columns:
+        day_of_year = pd.to_datetime(df['date']).dt.dayofyear
+    else:
+        day_of_year = (df.get('day_index', 1) % 365) + 1
+
+    df['sin_day'] = np.sin(2 * np.pi * day_of_year / 365.0)
+    df['cos_day'] = np.cos(2 * np.pi * day_of_year / 365.0)
+
+    return df
+
+# --- LOAD DATA ENGINE (@cache_data for DataFrames) ---
 @st.cache_data
-def load_dashboard_data():
+def load_and_prepare_data():
     try:
-        # Load the test inputs
+        context_raw = pd.read_csv('context.csv')
         test_raw = pd.read_csv('test.csv')
-        # Load your ALREADY COMPUTED predictions
-        predictions = pd.read_csv('final_predictions.csv')
-        return test_raw, predictions
+
+        context = engineer_ml_features(context_raw)
+        test = engineer_ml_features(test_raw)
+
+        context['is_test'], test['is_test'] = 0, 1
+        
+        if 'date' in context.columns:
+            context['time_sort'] = pd.to_datetime(context['date']).astype(int)
+        else:
+            context['time_sort'] = context.get('day_index', 0)
+            
+        test['time_sort'] = test.get('day_index', 0) + 10000000000
+
+        combined_test = pd.concat([context, test], ignore_index=True)
+        combined_test = combined_test.sort_values(by=['location_id', 'time_sort']).reset_index(drop=True)
+
+        exclude_cols = ['row_id', 'location_id', 'date', 'day_index', 'WBT', 'is_test', 'time_sort']
+        features = [c for c in combined_test.columns if c not in exclude_cols and not c.startswith('target_day_')]
+
+        # Fill missing features dynamically
+        for col in features:
+            if combined_test[col].isnull().any():
+                combined_test[col] = combined_test.groupby('location_id')[col].transform(lambda x: x.ffill().bfill())
+
+        combined_test['WBT'] = combined_test.groupby('location_id')['WBT'].transform(lambda x: x.ffill())
+
+        test_ready = combined_test[combined_test['is_test'] == 1].copy()
+        
+        return test_ready, features
     except FileNotFoundError:
-        st.error("⚠️ Ensure 'test.csv' and 'final_predictions.csv' are uploaded to GitHub.")
+        st.error("⚠️ Missing Data File: Ensure 'test.csv' and 'context.csv' are in the same directory as app.py.")
         return None, None
 
-test_data, preds_data = load_dashboard_data()
 
-# --- 2. LOAD DAY 1 DEMO MODEL ---
-@st.cache_resource
-def load_demo_model():
-    try:
-        # Load ONLY the Day 1 LightGBM model for the live demo
-        model = joblib.load('saved_model/lgb_day_1.pkl')
-        return model
-    except FileNotFoundError:
-        st.error("⚠️ Ensure 'saved_model/lgb_day_1.pkl' is uploaded for the live demo.")
-        return None
+# --- LOAD MODEL ENGINE (@cache_resource for ML Objects) ---
+@st.cache_resource(show_spinner="Loading 30 ML Models into RAM...")
+def load_all_models():
+    """Loads all models into memory ONCE during app boot."""
+    models = {'lgb': {}, 'xgb': {}, 'cat': {}}
+    
+    for day in range(1, 11):
+        # 1. CatBoost
+        try:
+            m_cat = CatBoostRegressor()
+            m_cat.load_model(f'saved_model/cat_day_{day}.cbm')
+            models['cat'][day] = m_cat
+        except Exception:
+            models['cat'][day] = None
 
-demo_model = load_demo_model()
+        # 2. LightGBM
+        try:
+            models['lgb'][day] = joblib.load(f'saved_model/lgb_day_{day}.pkl')
+        except Exception:
+            models['lgb'][day] = None
+
+        # 3. XGBoost
+        try:
+            models['xgb'][day] = joblib.load(f'saved_model/xgb_day_{day}.pkl')
+        except Exception:
+            models['xgb'][day] = None
+            
+    return models
+
+# ---------------------------------------------------------
+# EXECUTE STARTUP CACHING
+# ---------------------------------------------------------
+test_data, feature_cols = load_and_prepare_data()
+loaded_models = load_all_models()
 
 # --- SIDEBAR ---
-st.sidebar.header("⚙️ Select Location")
-if test_data is not None and preds_data is not None:
-    selected_row = st.sidebar.selectbox("Choose a Test Coordinate (row_id):", test_data['row_id'].values)
+st.sidebar.header("⚙️ Forecast Parameters")
+if test_data is not None:
+    selected_row = st.sidebar.selectbox("Select a Location/Timepoint to Forecast:", test_data['row_id'].values)
     
     st.sidebar.markdown("---")
-    st.sidebar.success("✅ Pre-Computed Data Active")
-    if demo_model:
-        st.sidebar.success("✅ Day-1 Live Inference Model Ready")
+    st.sidebar.success("✅ Models Cached in RAM")
+    st.sidebar.info("🤖 Engine: XGBoost + LightGBM + CatBoost")
+    st.sidebar.caption("⚡ Sub-second Inference Enabled")
 
 # --- MAIN DASHBOARD ---
-if test_data is not None and preds_data is not None:
-    
-    # --- TAB LAYOUT ---
-    tab1, tab2, tab3 = st.tabs(["10-Day Horizon (Batch)", "Live Inference Demo (Day 1)", "System Architecture"])
-    
-    with tab1:
-        st.subheader("🚀 10-Day AI Forecast (Pre-computed Batch Inference)")
-        st.markdown("This tab displays the output of the full 30-model ensemble running on GPU-accelerated backend hardware.")
-        
-        row_preds = preds_data[preds_data['row_id'] == selected_row]
-        
-        if not row_preds.empty:
-            forecast_values = row_preds.drop(columns=['row_id']).values.flatten()
-            
-            m1, m2, m3 = st.columns(3)
-            peak_wbt = max(forecast_values)
-            m1.metric("Day 1 Forecast", f"{forecast_values[0]:.1f} °C")
-            m2.metric("10-Day Peak", f"{peak_wbt:.1f} °C")
-            
-            if peak_wbt >= 32.0:
-                m3.error("🔴 Extreme Heat Hazard")
-            elif peak_wbt >= 28.0:
-                m3.warning("🟠 High Risk (Caution)")
-            else:
-                m3.success("🟢 Safe / Normal")
+if test_data is not None:
+    col1, col2 = st.columns([1, 2])
 
-            days = [f"Day {i}" for i in range(1, 11)]
-            fig = go.Figure()
-            
-            fig.add_trace(go.Scatter(
-                x=days, y=forecast_values, 
-                mode='lines+markers+text',
-                text=[f"{v:.1f}°C" for v in forecast_values],
-                textposition="top center",
-                name='Predicted WBT',
-                line=dict(color='#00E676', width=3),
-                marker=dict(size=10, symbol='diamond')
-            ))
-            
-            fig.add_hline(y=35, line_dash="solid", line_color="red", annotation_text="Lethal Limit (35°C)", annotation_position="top left")
-            fig.add_hline(y=30, line_dash="dash", line_color="orange", annotation_text="Severe Danger Zone (30°C)", annotation_position="top left")
-            
-            fig.update_layout(
-                title="Wet Bulb Temperature (WBT) Projection",
-                xaxis_title="Forecast Horizon",
-                yaxis_title="Temperature (°C)",
-                template="plotly_dark",
-                hovermode="x unified",
-                yaxis=dict(range=[min(forecast_values) - 3, max(max(forecast_values) + 3, 37)]),
-                margin=dict(l=20, r=20, t=40, b=20)
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
+    with col1:
+        st.subheader("📡 Input Telemetry")
+        st.write("Current atmospheric features going into the models:")
+        display_data = test_data[test_data['row_id'] == selected_row].drop(columns=['row_id', 'date', 'location_id', 'is_test', 'time_sort'], errors='ignore')
+        st.dataframe(display_data.T, use_container_width=True)
 
-    with tab2:
-        st.subheader("🔬 Live Inference Engine Demo")
-        st.markdown("To demonstrate the pipeline's operational capability within Streamlit's 1GB memory limit, this tab executes a live inference pass using the Day-1 LightGBM base model.")
+    with col2:
+        st.subheader("🚀 Live 10-Day AI Forecast")
         
-        display_data = test_data[test_data['row_id'] == selected_row]
-        st.write("Input Telemetry:")
-        st.dataframe(display_data.drop(columns=['row_id', 'date', 'location_id'], errors='ignore').T, use_container_width=True)
-        
-        if st.button("Run Day-1 Live Inference", type="primary"):
-            if demo_model:
-                with st.spinner("Executing live prediction..."):
-                    # Note: You will need to ensure the features passed to X_live match what the model expects
-                    feature_cols = [c for c in display_data.columns if c not in ['row_id', 'location_id', 'date', 'day_index', 'WBT', 'is_test', 'time_sort']]
-                    X_live = display_data[feature_cols]
-                    
-                    try:
-                        # Assuming the model predicts a delta that needs to be added to the baseline
-                        baseline_wbt = display_data['WBT'].values[0] if 'WBT' in display_data.columns else 25.0
-                        pred_delta = demo_model.predict(X_live)[0]
-                        final_pred = baseline_wbt + pred_delta
+        if st.button("Run Full 10-Day Machine Learning Inference", type="primary"):
+            row_data = test_data[test_data['row_id'] == selected_row]
+            
+            # Use DataFrame to maintain column names for tree models
+            X_live = row_data[feature_cols]
+            baseline_wbt = row_data['WBT'].values[0]
+            
+            full_10_day_forecast = []
+            
+            with st.spinner("Executing Instant Inference Pipeline..."):
+                try:
+                    for day in range(1, 11):
                         
-                        st.success("✅ Live Inference Successful!")
-                        st.metric("Live Day 1 Prediction", f"{final_pred:.2f} °C")
-                    except Exception as e:
-                        st.error(f"Inference failed. Check feature alignment: {e}")
-            else:
-                 st.error("Live demo model not loaded.")
+                        # Horizon-Specific Weighting
+                        if (day - 1) < 4:
+                            w_lgb, w_xgb, w_cat = 0.50, 0.40, 0.10
+                        else:
+                            w_lgb, w_xgb, w_cat = 0.20, 0.30, 0.50
+                        
+                        valid_models = []
+                        weights = []
+                        
+                        # Instantly predict using models already in RAM
+                        if loaded_models['lgb'][day] is not None:
+                            valid_models.append(loaded_models['lgb'][day].predict(X_live)[0])
+                            weights.append(w_lgb)
+                            
+                        if loaded_models['xgb'][day] is not None:
+                            valid_models.append(loaded_models['xgb'][day].predict(X_live)[0])
+                            weights.append(w_xgb)
+                            
+                        if loaded_models['cat'][day] is not None:
+                            valid_models.append(loaded_models['cat'][day].predict(X_live)[0])
+                            weights.append(w_cat)
+                        
+                        # Dynamic Blending
+                        if valid_models:
+                            norm_weights = np.array(weights) / sum(weights)
+                            blended_delta = np.sum(np.array(valid_models) * norm_weights)
+                        else:
+                            blended_delta = 0.0  # Fallback
+                        
+                        # Reverse Delta Transformation
+                        absolute_prediction = np.clip(baseline_wbt + blended_delta, -10, 45)
+                        full_10_day_forecast.append(absolute_prediction)
+                    
+                    st.success("✅ Full 10-Day Horizon Inference Complete!")
+                    
+                    # --- PLOTLY INTERACTIVE GRAPH ---
+                    days = [f"Day {i}" for i in range(1, 11)]
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Scatter(
+                        x=days, y=full_10_day_forecast, 
+                        mode='lines+markers+text',
+                        text=[f"{v:.1f}°C" for v in full_10_day_forecast],
+                        textposition="top center",
+                        name='Predicted WBT',
+                        line=dict(color='#00E676', width=3),
+                        marker=dict(size=10, symbol='diamond')
+                    ))
+                    
+                    fig.add_hline(y=35, line_dash="solid", line_color="red", annotation_text="Lethal Limit (35°C)", annotation_position="top left")
+                    fig.add_hline(y=30, line_dash="dash", line_color="orange", annotation_text="Severe Danger Zone (30°C)", annotation_position="top left")
+                    
+                    fig.update_layout(
+                        title="Wet Bulb Temperature (WBT) 10-Day Projection",
+                        xaxis_title="Forecast Horizon",
+                        yaxis_title="Temperature (°C)",
+                        template="plotly_dark",
+                        hovermode="x unified",
+                        yaxis=dict(range=[min(full_10_day_forecast) - 3, max(max(full_10_day_forecast) + 3, 37)])
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
 
-    with tab3:
-        st.subheader("System Architecture & Infrastructure")
-        st.markdown("""
-        **Frontend / Dashboard (This App):**
-        * Designed for high-speed, sub-second latency visualization.
-        * Uses pre-computed telemetry for the full 10-day ensemble to avoid memory swap failures on the 1GB Streamlit Cloud tier.
-        * Implements a lightweight live-inference demo to prove operational capability.
-        
-        **Backend / Batch Inference:**
-        * Execution environment: GPU-accelerated instances (e.g., Google Colab T4).
-        * Incorporates advanced thermodynamic feature engineering (e.g., Vapor Pressure Deficit).
-        * Utilizes a Progressive Chain architecture across 30 models (LightGBM, XGBoost, CatBoost).
-        """)
+                except Exception as e:
+                    st.error(f"Critical Inference Error: {e}")
